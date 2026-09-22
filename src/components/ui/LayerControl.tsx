@@ -1,6 +1,7 @@
 'use client';
 
 import { Layers, RefreshCw } from 'lucide-react';
+import { useShallow } from 'zustand/react/shallow';
 import { LAYERS } from '@/lib/api/sources';
 import { ErrorState } from '@/components/ui/ErrorState';
 import { useTerraScope } from '@/lib/store/useTerraScope';
@@ -36,13 +37,19 @@ const COUNT_KEYS: Record<LayerId, 'earthquakes' | 'naturalEvents' | 'flights' | 
 export function LayerControl({ retries, variant = 'panel', className = '' }: LayerControlProps) {
   const layers = useTerraScope((s) => s.layers);
   const toggleLayer = useTerraScope((s) => s.toggleLayer);
-  const state = useTerraScope((s) => ({
-    earthquakes: s.earthquakes,
-    naturalEvents: s.naturalEvents,
-    flights: s.flights,
-    airQuality: s.airQuality,
-    weather: s.weather,
-  }));
+  // useShallow is REQUIRED here: the selector builds a new object every call,
+  // and without a shallow comparison Zustand v5 (useSyncExternalStore) sees a
+  // new snapshot on every render -> infinite re-render -> React error #185
+  // ("Maximum update depth exceeded") the moment this panel mounts.
+  const state = useTerraScope(
+    useShallow((s) => ({
+      earthquakes: s.earthquakes,
+      naturalEvents: s.naturalEvents,
+      flights: s.flights,
+      airQuality: s.airQuality,
+      weather: s.weather,
+    })),
+  );
   const focusedPlace = useTerraScope((s) => s.focusedPlace);
   const now = useNow(1000);
 
