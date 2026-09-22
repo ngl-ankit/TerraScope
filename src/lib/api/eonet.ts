@@ -1,4 +1,5 @@
 import { fetchJson } from './http';
+import { getJsonViaIpv4 } from './fetchIpv4';
 import { sanitizeText, sanitizeUrl, titleCase } from '@/lib/utils/format';
 import type { NaturalEvent, NaturalEventCategory, NaturalEventSource } from '@/lib/types';
 
@@ -229,6 +230,34 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * Reads EONET over a connection pinned to IPv4.
+ *
+ * A hostname-based connect hangs on this host's unreachable IPv6 route (measured:
+ * the IPv4 handshake answers in ~370ms while the hostname connect times out), so
+ * the pinned transport is tried first and an ordinary fetch is kept as the
+ * fallback for networks where IPv6 behaves normally.
+ */
+async function fetchEonetJson<T>(url: string, timeoutMs: number, signal?: AbortSignal): Promise<T> {
+  try {
+    return await getJsonViaIpv4<T>(url, {
+      provider: 'NASA EONET',
+      timeoutMs,
+      headers: { 'User-Agent': OUTBOUND_USER_AGENT },
+      signal,
+    });
+  } catch (error) {
+    if (signal?.aborted) throw error;
+    return fetchJson<T>(url, {
+      provider: 'NASA EONET',
+      timeoutMs,
+      retries: 1,
+      headers: { 'User-Agent': OUTBOUND_USER_AGENT },
+      signal,
+    });
+  }
+}
+
 export async function fetchNaturalEvents(signal?: AbortSignal): Promise<NaturalEventsPayload> {
   const url = `${baseUrl()}/events?status=open&days=14&limit=140`;
   let lastError: unknown;
@@ -241,12 +270,7 @@ export async function fetchNaturalEvents(signal?: AbortSignal): Promise<NaturalE
   for (let attempt = 1; attempt <= ATTEMPTS; attempt += 1) {
     if (signal?.aborted) break;
     try {
-      const response = await fetchJson<EonetResponse>(url, {
-        provider: 'NASA EONET',
-        timeoutMs: attempt === 1 ? 20_000 : 25_000,
-        headers: { 'User-Agent': OUTBOUND_USER_AGENT },
-        signal,
-      });
+      const response = await fetchEonetJson<EonetResponse>(url, attempt === 1 ? 20_000 : 25_000, signal);
       return normaliseNaturalEvents(response);
     } catch (error) {
       lastError = error;
@@ -257,15 +281,10 @@ export async function fetchNaturalEvents(signal?: AbortSignal): Promise<NaturalE
 
   // Last resort: the pre-built geojson document for the same feed.
   try {
-    const geo = await fetchJson<{ features?: EonetFeature[] }>(
+    const geo = await fetchEonetJson<{ features?: EonetFeature[] }>(
       `${baseUrl()}/events/geojson?status=open&days=14&limit=140`,
-      {
-        provider: 'NASA EONET',
-        timeoutMs: 20_000,
-        retries: 1,
-        headers: { 'User-Agent': OUTBOUND_USER_AGENT },
-        signal,
-      },
+      20_000,
+      signal,
     );
     return normaliseEonetGeojson(geo);
   } catch (fallbackError) {

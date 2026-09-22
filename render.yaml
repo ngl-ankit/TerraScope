@@ -21,7 +21,7 @@ services:
       # (NASA EONET, OpenSky) time out from this network while resolving
       # to an address family that never completes a handshake.
       - key: NODE_OPTIONS
-        value: "--dns-result-order=ipv4first"
+        value: "--dns-result-order=ipv4first --no-network-family-autoselection"
       - key: NEXT_PUBLIC_SITE_URL
         value: https://terrascope.onrender.com
       # OpenSky anonymous access is throttled (~400 credits/day on /states/all).
