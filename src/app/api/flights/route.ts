@@ -63,6 +63,14 @@ export async function GET(request: Request) {
       );
     }
 
-    return Response.json(body, { status, headers: { 'Cache-Control': 'no-store' } });
+    // Unreachable upstream is retryable: tell the client how long to wait so it
+    // does not hammer a blocked host every 15 seconds.
+    return Response.json(body, {
+      status,
+      headers: {
+        'Cache-Control': 'no-store',
+        ...(body.retryable ? { 'Retry-After': '300' } : {}),
+      },
+    });
   }
 }

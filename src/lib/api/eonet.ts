@@ -176,6 +176,53 @@ export function normaliseNaturalEvents(response: EonetResponse): NaturalEventsPa
   return { events, observedAt: newest > 0 ? newest : null };
 }
 
+
+interface EonetFeature {
+  geometry?: { type?: string; coordinates?: unknown };
+  properties?: {
+    id?: string;
+    title?: string;
+    description?: string | null;
+    link?: string;
+    closed?: string | null;
+    date?: string;
+    magnitudeValue?: number | null;
+    magnitudeUnit?: string | null;
+    categories?: Array<{ id?: string; title?: string }>;
+    sources?: Array<{ id?: string; url?: string }>;
+  };
+}
+
+/**
+ * `/events/geojson` carries the newest geometry per event as a single feature.
+ * It is a pre-built document (served in ~2s) rather than the per-request
+ * `/events` collection, so it is the fallback before a layer is allowed to fail.
+ */
+export function normaliseEonetGeojson(response: { features?: EonetFeature[] }): NaturalEventsPayload {
+  const events: EonetRawEvent[] = (response.features ?? []).map((feature) => {
+    const properties = feature.properties ?? {};
+    return {
+      id: properties.id,
+      title: properties.title,
+      description: properties.description ?? null,
+      link: properties.link,
+      closed: properties.closed ?? null,
+      categories: properties.categories,
+      sources: properties.sources,
+      geometry: [
+        {
+          date: properties.date,
+          type: feature.geometry?.type,
+          coordinates: feature.geometry?.coordinates,
+          magnitudeValue: properties.magnitudeValue ?? null,
+          magnitudeUnit: properties.magnitudeUnit ?? null,
+        },
+      ],
+    };
+  });
+  return normaliseNaturalEvents({ events });
+}
+
 const ATTEMPTS = 3;
 
 function delay(ms: number): Promise<void> {
@@ -206,6 +253,22 @@ export async function fetchNaturalEvents(signal?: AbortSignal): Promise<NaturalE
       if (signal?.aborted) break;
       if (attempt < ATTEMPTS) await delay(700 * attempt);
     }
+  }
+
+  // Last resort: the pre-built geojson document for the same feed.
+  try {
+    const geo = await fetchJson<{ features?: EonetFeature[] }>(
+      `${baseUrl()}/events/geojson?status=open&days=14&limit=140`,
+      {
+        provider: 'NASA EONET',
+        timeoutMs: 20_000,
+        headers: { 'User-Agent': OUTBOUND_USER_AGENT },
+        signal,
+      },
+    );
+    return normaliseEonetGeojson(geo);
+  } catch (fallbackError) {
+    lastError = fallbackError;
   }
 
   throw lastError;

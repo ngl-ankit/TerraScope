@@ -12,6 +12,8 @@ import type { WeatherBundle, WeatherCurrent, WeatherDay, WeatherHour } from '@/l
  * Docs: https://open-meteo.com/en/docs
  */
 
+const OUTBOUND_USER_AGENT = 'TerraScope/1.0 (+https://github.com/ngl-ankit/TerraScope)';
+
 export function forecastBaseUrl(): string {
   return process.env.OPEN_METEO_FORECAST_URL ?? 'https://api.open-meteo.com/v1/forecast';
 }
@@ -185,6 +187,189 @@ export function normaliseWeather(raw: OpenMeteoResponse, fallbackLat: number, fa
   };
 }
 
+
+/* ─────────────────────── MET Norway fallback provider ───────────────────────
+ * Open-Meteo throttles by client IP, so a shared datacenter egress can be
+ * rate-limited through no fault of this deployment (observed: persistent HTTP
+ * 429 from the Render free instance while the same call answered 200 from
+ * elsewhere). MET Norway publishes the same public forecast, needs no key, and
+ * is not IP-throttled, so a throttled primary degrades to a working forecast
+ * instead of an error the user cannot act on.
+ *
+ * Docs: https://api.met.no/weatherapi/locationforecast/2.0/documentation
+ */
+
+const MET_BASE_URL = 'https://api.met.no/weatherapi/locationforecast/2.0/compact';
+
+interface MetEntry {
+  time?: string;
+  data?: {
+    instant?: { details?: Record<string, number | null | undefined> };
+    next_1_hours?: { summary?: { symbol_code?: string }; details?: { precipitation_amount?: number } };
+    next_6_hours?: { summary?: { symbol_code?: string }; details?: { precipitation_amount?: number } };
+  };
+}
+
+interface MetResponse {
+  properties?: { timeseries?: MetEntry[] };
+}
+
+/** MET publishes `symbol_code`, not a WMO number; map back onto the WMO table. */
+const MET_SYMBOL_WMO: Record<string, number> = {
+  clearsky: 0,
+  fair: 1,
+  partlycloudy: 2,
+  cloudy: 3,
+  fog: 45,
+  lightrain: 61,
+  lightrainshowers: 61,
+  rain: 63,
+  rainshowers: 63,
+  heavyrain: 65,
+  heavyrainshowers: 65,
+  lightrainandthunder: 95,
+  rainandthunder: 95,
+  heavyrainandthunder: 95,
+  lightrainshowersandthunder: 95,
+  rainshowersandthunder: 95,
+  heavyrainshowersandthunder: 95,
+  thunderstorm: 95,
+  lightsleet: 66,
+  sleet: 67,
+  heavysleet: 67,
+  lightsnow: 71,
+  snow: 73,
+  heavysnow: 75,
+  lightsnowshowers: 85,
+  snowshowers: 85,
+  heavysnowshowers: 86,
+  lightsleetandthunder: 95,
+  sleetandthunder: 95,
+  lightsnowandthunder: 95,
+  snowandthunder: 95,
+  partlycloudyandrain: 80,
+  partlycloudyandlightrain: 80,
+  partlycloudyandsnow: 85,
+};
+
+function metSymbolToWmo(symbol: string | undefined): number | null {
+  if (!symbol) return null;
+  return MET_SYMBOL_WMO[symbol.replace(/_(day|night|polartwilight)$/, '')] ?? null;
+}
+
+function metNum(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+/** MET emits `2026-09-22T15:00:00Z`; Open-Meteo emits `2026-09-22T15:00`. */
+function metTime(iso: string | undefined): string | null {
+  return typeof iso === 'string' && iso.length >= 16 ? iso.slice(0, 16) : null;
+}
+
+function msToKmh(ms: number | null): number | null {
+  return ms === null ? null : Math.round(ms * 3.6 * 10) / 10;
+}
+
+export function normaliseMetWeather(raw: MetResponse, lat: number, lon: number): WeatherBundle {
+  const series = raw.properties?.timeseries ?? [];
+  const first = series[0];
+  const inst = first?.data?.instant?.details ?? {};
+  const symbol =
+    first?.data?.next_1_hours?.summary?.symbol_code ?? first?.data?.next_6_hours?.summary?.symbol_code;
+  const code = metSymbolToWmo(symbol);
+
+  const current: WeatherCurrent = {
+    time: metTime(first?.time) ?? new Date().toISOString().slice(0, 16),
+    temperatureC: metNum(inst.air_temperature),
+    apparentC: null,
+    humidityPct: metNum(inst.relative_humidity),
+    precipitationMm: metNum(first?.data?.next_1_hours?.details?.precipitation_amount),
+    weatherCode: code,
+    condition: weatherCondition(code),
+    windSpeedKmh: msToKmh(metNum(inst.wind_speed)),
+    windGustKmh: null,
+    windDirectionDeg: metNum(inst.wind_from_direction),
+    pressureHpa: metNum(inst.air_pressure_at_sea_level),
+    cloudCoverPct: metNum(inst.cloud_area_fraction),
+    isDay: symbol ? !symbol.includes('_night') : null,
+  };
+
+  const hourly: WeatherHour[] = [];
+  for (let i = 0; i < Math.min(series.length, 24); i += 1) {
+    const entry = series[i];
+    const time = metTime(entry?.time);
+    if (!time) continue;
+    const details = entry?.data?.instant?.details ?? {};
+    hourly.push({
+      time,
+      temperatureC: metNum(details.air_temperature),
+      weatherCode: metSymbolToWmo(
+        entry?.data?.next_1_hours?.summary?.symbol_code ??
+          entry?.data?.next_6_hours?.summary?.symbol_code,
+      ),
+      precipitationProbabilityPct: null,
+      windSpeedKmh: msToKmh(metNum(details.wind_speed)),
+    });
+  }
+
+  // MET returns ~one entry per hour; roll them up into calendar days.
+  const days = new Map<string, { min: number | null; max: number | null; precip: number; codes: number[] }>();
+  for (const entry of series) {
+    const iso = entry?.time;
+    if (!iso) continue;
+    const day = iso.slice(0, 10);
+    const bucket = days.get(day) ?? { min: null, max: null, precip: 0, codes: [] };
+    const temp = metNum(entry?.data?.instant?.details?.air_temperature);
+    if (temp !== null) {
+      bucket.min = bucket.min === null ? temp : Math.min(bucket.min, temp);
+      bucket.max = bucket.max === null ? temp : Math.max(bucket.max, temp);
+    }
+    const amount = metNum(entry?.data?.next_1_hours?.details?.precipitation_amount);
+    if (amount !== null) bucket.precip += amount;
+    const dayCode = metSymbolToWmo(
+      entry?.data?.next_6_hours?.summary?.symbol_code ??
+        entry?.data?.next_1_hours?.summary?.symbol_code,
+    );
+    if (dayCode !== null) bucket.codes.push(dayCode);
+    days.set(day, bucket);
+  }
+
+  const daily: WeatherDay[] = [...days.entries()].slice(0, 6).map(([date, bucket]) => {
+    const dayCode = bucket.codes.length > 0 ? bucket.codes[Math.floor(bucket.codes.length / 2)] : null;
+    return {
+      date,
+      weatherCode: dayCode,
+      condition: weatherCondition(dayCode),
+      maxC: bucket.max,
+      minC: bucket.min,
+      precipitationMm: Math.round(bucket.precip * 10) / 10,
+      // MET's compact document carries no sunrise/sunset.
+      sunrise: null,
+      sunset: null,
+    };
+  });
+
+  return {
+    lat,
+    lon,
+    elevationM: null,
+    // MET timestamps are UTC; labelled as such rather than guessed from longitude.
+    timezone: 'UTC',
+    timezoneAbbreviation: 'UTC',
+    current,
+    hourly,
+    daily,
+  };
+}
+
+export async function fetchWeatherFromMet(lat: number, lon: number, signal?: AbortSignal): Promise<WeatherBundle> {
+  const raw = await fetchJson<MetResponse>(
+    `${MET_BASE_URL}?lat=${lat.toFixed(4)}&lon=${lon.toFixed(4)}`,
+    { provider: 'MET Norway', headers: { 'User-Agent': OUTBOUND_USER_AGENT }, timeoutMs: 12_000, signal },
+  );
+  return normaliseMetWeather(raw, lat, lon);
+}
+
 export async function fetchWeather(lat: number, lon: number, signal?: AbortSignal): Promise<WeatherBundle> {
   const params = new URLSearchParams({
     latitude: lat.toFixed(4),
@@ -197,12 +382,21 @@ export async function fetchWeather(lat: number, lon: number, signal?: AbortSigna
     wind_speed_unit: 'kmh',
   });
 
-  const raw = await fetchJson<OpenMeteoResponse>(`${forecastBaseUrl()}?${params.toString()}`, {
-    provider: 'Open-Meteo',
-        headers: { 'User-Agent': 'TerraScope/1.0 (+https://github.com/ngl-ankit/TerraScope)' },
-    timeoutMs: 12_000,
-    signal,
-  });
-
-  return normaliseWeather(raw, lat, lon);
+  try {
+    const raw = await fetchJson<OpenMeteoResponse>(`${forecastBaseUrl()}?${params.toString()}`, {
+      provider: 'Open-Meteo',
+      headers: { 'User-Agent': OUTBOUND_USER_AGENT },
+      timeoutMs: 12_000,
+      signal,
+    });
+    return normaliseWeather(raw, lat, lon);
+  } catch (error) {
+    if (signal?.aborted) throw error;
+    try {
+      return await fetchWeatherFromMet(lat, lon, signal);
+    } catch {
+      // Both providers down: surface the primary provider's error.
+      throw error;
+    }
+  }
 }
