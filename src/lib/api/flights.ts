@@ -4,6 +4,15 @@ import { AIRPORTS } from './flightCatalog';
 import type { Aircraft, FlightsSnapshot } from '@/lib/types';
 
 /**
+ * Descriptive User-Agent for every outbound call.
+ *
+ * The default `node` UA is rejected outright by some providers and CDNs
+ * fronting them; a contactable UA is also the documented requirement for
+ * Nominatim. Sending one costs nothing and removes a whole class of blocks.
+ */
+const OUTBOUND_USER_AGENT = 'TerraScope/1.0 (+https://github.com/ngl-ankit/TerraScope)';
+
+/**
  * OpenSky Network — live aircraft state vectors.
  *
  * Rate-limit reality (documented at https://openskynetwork.github.io/opensky-api/rest.html):
@@ -63,13 +72,26 @@ async function accessToken(): Promise<string | null> {
     client_secret: process.env.OPEN_SKY_CLIENT_SECRET as string,
   });
 
-  const response = await fetch(tokenUrl(), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body,
-    signal: AbortSignal.timeout(10_000),
-    cache: 'no-store',
-  });
+  let response: Response;
+  try {
+    response = await fetch(tokenUrl(), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'User-Agent': OUTBOUND_USER_AGENT,
+      },
+      body,
+      // Short budget: authenticating is an optimisation, not a requirement.
+      signal: AbortSignal.timeout(6_000),
+      cache: 'no-store',
+    });
+  } catch {
+    // Root cause of the /api/flights 500: this call was unguarded, so an
+    // unreachable token endpoint (observed: 10s abort on the host's egress)
+    // threw straight out of the route -> "Unexpected failure" 500 with zero
+    // aircraft. Anonymous OpenSky access still works, so degrade to it.
+    return null;
+  }
 
   if (!response.ok) return null;
 
@@ -158,7 +180,7 @@ export interface FlightsResult extends FlightsSnapshot {
  */
 export async function fetchFlights(signal?: AbortSignal): Promise<FlightsResult> {
   const token = await accessToken();
-  const headers: Record<string, string> = {};
+  const headers: Record<string, string> = { 'User-Agent': OUTBOUND_USER_AGENT };
   if (token) headers.Authorization = `Bearer ${token}`;
 
   const results = await Promise.allSettled(

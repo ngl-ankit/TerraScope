@@ -199,6 +199,7 @@ export async function fetchWeather(lat: number, lon: number, signal?: AbortSigna
 
   const raw = await fetchJson<OpenMeteoResponse>(`${forecastBaseUrl()}?${params.toString()}`, {
     provider: 'Open-Meteo',
+        headers: { 'User-Agent': 'TerraScope/1.0 (+https://github.com/ngl-ankit/TerraScope)' },
     timeoutMs: 12_000,
     signal,
   });

@@ -2,6 +2,9 @@ import { fetchJson } from './http';
 import { sanitizeText, sanitizeUrl, titleCase } from '@/lib/utils/format';
 import type { NaturalEvent, NaturalEventCategory, NaturalEventSource } from '@/lib/types';
 
+/** Contactable UA — nasa.gov is CDN-fronted and drops default agents. */
+const OUTBOUND_USER_AGENT = 'TerraScope/1.0 (+https://github.com/ngl-ankit/TerraScope)';
+
 /**
  * NASA EONET v3 — Earth Observatory Natural Event Tracker.
  *
@@ -194,6 +197,7 @@ export async function fetchNaturalEvents(signal?: AbortSignal): Promise<NaturalE
       const response = await fetchJson<EonetResponse>(url, {
         provider: 'NASA EONET',
         timeoutMs: attempt === 1 ? 20_000 : 25_000,
+        headers: { 'User-Agent': OUTBOUND_USER_AGENT },
         signal,
       });
       return normaliseNaturalEvents(response);
