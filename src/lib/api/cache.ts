@@ -117,5 +117,5 @@ export const TTL = {
   flights: () => envSeconds('CACHE_TTL_FLIGHTS', 12) * 1000,
   airQuality: () => envSeconds('CACHE_TTL_AIR_QUALITY', 600) * 1000,
   geocode: () => envSeconds('CACHE_TTL_GEOCODE', 300) * 1000,
-  weather: () => envSeconds('CACHE_TTL_WEATHER', 600) * 1000,
+  weather: () => envSeconds('CACHE_TTL_WEATHER', 3600) * 1000,
 };

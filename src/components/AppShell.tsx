@@ -148,18 +148,28 @@ export default function AppShell() {
       </div>
 
       {/* ── Desktop / tablet: left dock ── */}
+      {/*
+        The dock and the HUD cluster below are both `fixed left-4 w-[19rem]`, so
+        they must be given mutually exclusive vertical bands. Anchoring the dock
+        to BOTH `top-24` and `bottom-[14.5rem]` reserves the HUD's height, and
+        the inner panels then arbitrate: Data layers keeps its natural height
+        (capped, scrolling if the viewport is very short) and the event feed
+        takes the remainder and scrolls internally — previously neither panel
+        was height-bounded, so the feed rendered at full length and the HUD was
+        painted on top of it.
+      */}
       <aside
         id="terrascope-layer-panel"
-        className={`fixed left-4 top-24 z-20 hidden w-[19rem] flex-col gap-2 lg:flex ${
-          layerPanelOpen ? '' : 'lg:flex'
-        }`}
+        className="fixed left-4 top-24 bottom-[14.5rem] z-20 hidden w-[19rem] flex-col gap-2 lg:flex"
         aria-label="Layer controls"
       >
-        <div className="panel-shell overflow-hidden">
-          <LayerControl retries={retries} />
+        <div className="panel-shell flex max-h-[55%] shrink-0 flex-col overflow-hidden">
+          <div className="scroll-thin min-h-0 overflow-y-auto">
+            <LayerControl retries={retries} />
+          </div>
         </div>
 
-        <div className="panel-shell overflow-hidden">
+        <div className="panel-shell flex min-h-0 flex-1 flex-col overflow-hidden">
           <EventList retries={retries} />
         </div>
       </aside>
@@ -239,8 +249,12 @@ export default function AppShell() {
         )}
       </aside>
 
-      {/* ── Camera controls + HUD ── */}
-      <div className="pointer-events-none fixed right-3 z-30 flex flex-col items-end gap-2 sm:right-4 lg:right-4">
+      {/*
+        Camera controls + HUD. On desktop the rail clears the details dock:
+        both were anchored at `right-4`, so the rail was painted across the
+        panel's right edge. `23.5rem` = 21.5rem dock + 1rem gap + 1rem gutter.
+      */}
+      <div className="pointer-events-none fixed right-3 z-30 flex flex-col items-end gap-2 sm:right-4 lg:right-[23.5rem]">
         <div className="absolute right-0 top-[calc(100dvh-4rem)] -translate-y-full">
           <GlobeControls />
         </div>
