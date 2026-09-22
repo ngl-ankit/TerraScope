@@ -18,8 +18,8 @@
     "build": "next build",
     "start": "next start",
     "typecheck": "tsc --noEmit",
-    "data:borders": "node scripts/build-borders.mjs",
-    "render_build": "npm run borders && next build"
+    "render_build": "npm run borders && next build",
+    "borders": "node scripts/build-borders.mjs"
   },
   "dependencies": {
     "@react-three/drei": "^10.0.6",
