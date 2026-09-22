@@ -1,4 +1,4 @@
-import { cached, TTL } from '@/lib/api/cache';
+import { cached, TTL, cooldownRemaining, setCooldown } from '@/lib/api/cache';
 import { fetchFlights, hasCredentials } from '@/lib/api/flights';
 import { toRouteError, UpstreamError } from '@/lib/api/http';
 import type { ApiEnvelope, FlightsSnapshot, SourceMeta } from '@/lib/types';
@@ -14,9 +14,28 @@ import type { ApiEnvelope, FlightsSnapshot, SourceMeta } from '@/lib/types';
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
 
+const FLIGHTS_KEY = 'opensky:regions';
+
 export async function GET(request: Request) {
+  // While the provider is refusing us, answer from the cooldown instead of
+  // becoming another upstream call.
+  const cooling = cooldownRemaining(FLIGHTS_KEY);
+  if (cooling > 0) {
+    return Response.json(
+      {
+        error: 'OpenSky Network is rate limiting this deployment. The flights layer has been paused.',
+        code: 'upstream_rate_limited',
+        retryable: true,
+      },
+      {
+        status: 429,
+        headers: { 'Cache-Control': 'no-store', 'Retry-After': String(Math.ceil(cooling / 1000)) },
+      },
+    );
+  }
+
   try {
-    const outcome = await cached({ key: 'opensky:regions', ttlMs: TTL.flights() }, () =>
+    const outcome = await cached({ key: FLIGHTS_KEY, ttlMs: TTL.flights() }, () =>
       fetchFlights(request.signal),
     );
 
@@ -49,6 +68,8 @@ export async function GET(request: Request) {
     return Response.json(body, { headers: { 'Cache-Control': 'no-store' } });
   } catch (error) {
     const { body, status } = toRouteError(error, 'OpenSky Network');
+
+    if (error instanceof UpstreamError && error.retryable) setCooldown(FLIGHTS_KEY, 180_000);
 
     // A 429 from OpenSky is expected behaviour for anonymous clients, not a
     // bug: surface it as a clear, non-alarming state.

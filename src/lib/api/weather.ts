@@ -387,6 +387,8 @@ export async function fetchWeather(lat: number, lon: number, signal?: AbortSigna
       provider: 'Open-Meteo',
       headers: { 'User-Agent': OUTBOUND_USER_AGENT },
       timeoutMs: 12_000,
+      // One retry absorbs a dropped connection; a 429 is not retried (see http.ts).
+      retries: 1,
       signal,
     });
     return normaliseWeather(raw, lat, lon);

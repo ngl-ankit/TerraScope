@@ -262,6 +262,7 @@ export async function fetchNaturalEvents(signal?: AbortSignal): Promise<NaturalE
       {
         provider: 'NASA EONET',
         timeoutMs: 20_000,
+        retries: 1,
         headers: { 'User-Agent': OUTBOUND_USER_AGENT },
         signal,
       },

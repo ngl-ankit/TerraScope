@@ -70,6 +70,12 @@ function classify(provider: string, status: number): UpstreamError {
 export interface FetchOptions {
   /** Provider name used in error messages and logs. */
   provider: string;
+  /**
+   * Extra attempts after a retryable failure (dropped connection, timeout, 5xx).
+   * Bounded by design: a provider that is down stays down, and the caller
+   * decides whether to serve a stale payload or a fallback provider instead.
+   */
+  retries?: number;
   timeoutMs?: number;
   headers?: Record<string, string>;
   /** Next.js fetch cache directive. TerraScope caches in its own layer, so this defaults to `no-store`. */
@@ -85,7 +91,38 @@ export interface FetchOptions {
  * `AbortSignal.any` keeps both the caller's cancellation and our timeout in
  * play, so a cancelled request is not reported as an upstream failure.
  */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Capped exponential backoff: 400ms, 800ms, 1600ms — never longer. */
+function backoffMs(attempt: number): number {
+  return Math.min(400 * 2 ** attempt, 1_600);
+}
+
 export async function fetchJson<T>(url: string, options: FetchOptions): Promise<T> {
+  const { retries = 0 } = options;
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      return await fetchJsonOnce<T>(url, options);
+    } catch (error) {
+      lastError = error;
+      const retryable = error instanceof UpstreamError && error.retryable;
+      // A 429 is a quota signal, not a hiccup: retrying inside the request only
+      // spends more of the same budget. The caller's cooldown and the fallback
+      // provider handle it instead.
+      const rateLimited = error instanceof UpstreamError && error.code === 'upstream_rate_limited';
+      if (!retryable || rateLimited || attempt === retries || options.signal?.aborted) break;
+      await sleep(backoffMs(attempt));
+    }
+  }
+
+  throw lastError;
+}
+
+async function fetchJsonOnce<T>(url: string, options: FetchOptions): Promise<T> {
   const { provider, timeoutMs = 12_000, headers = {}, cache = 'no-store', signal, accept = 'json' } = options;
 
   const timeout = AbortSignal.timeout(timeoutMs);

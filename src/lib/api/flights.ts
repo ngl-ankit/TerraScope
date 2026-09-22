@@ -171,6 +171,165 @@ export interface FlightsResult extends FlightsSnapshot {
   regionsQueried: string[];
 }
 
+/* ───────────────────── Community ADS-B fallback (no credentials) ──────────
+ * OpenSky is the primary source, but its REST API is unreachable from some
+ * networks: measured from this deployment's egress the TCP handshake to
+ * opensky-network.org times out on both IPv4 and IPv6, so every flights request
+ * failed outright rather than being rate-limited. Community aggregators publish
+ * the same ADS-B state vectors over a key-free JSON API, so a total OpenSky
+ * failure degrades to live (coarser) data instead of an empty layer.
+ *
+ * Endpoint contract, verified against the live API:
+ *   GET {base}/v2/point/{lat}/{lon}/{radiusNm}  ->  { now, ac: [ {...} ] }
+ * `now` is a millisecond epoch; `alt_baro` is feet or the string "ground".
+ * Docs: https://adsb.lol/docs/openapi/
+ */
+
+const COMMUNITY_ADSB_BASE_URL = (process.env.COMMUNITY_ADSB_BASE_URL ?? 'https://api.adsb.lol').replace(/\/$/, '');
+
+/** Radius in nautical miles. A point query is capped at 250 nm. */
+const COMMUNITY_RADIUS_NM = 250;
+
+/** Dense-airspace centres, mirroring the OpenSky sample regions. */
+interface CommunityPoint {
+  label: string;
+  lat: number;
+  lon: number;
+}
+
+const COMMUNITY_POINTS: readonly CommunityPoint[] = [
+  { label: 'Western Europe', lat: 50, lon: 7 },
+  { label: 'North America', lat: 40, lon: -95 },
+  { label: 'East Asia', lat: 35, lon: 135 },
+];
+
+interface CommunityRow {
+  hex?: string;
+  flight?: string;
+  lat?: number;
+  lon?: number;
+  alt_baro?: number | string;
+  gs?: number;
+  track?: number;
+  baro_rate?: number;
+  squawk?: string;
+  seen?: number;
+}
+
+interface CommunityResponse {
+  now?: number;
+  ac?: CommunityRow[];
+}
+
+/** Feet -> metres, knots -> m/s, feet per minute -> m/s. */
+const FT_TO_M = 0.3048;
+const KT_TO_MS = 0.514444;
+const FPM_TO_MS = 0.00508;
+
+function communityNum(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+/** Maps one community ADS-B row onto the internal `Aircraft` shape. */
+export function mapCommunityRow(row: CommunityRow, nowSeconds: number): Aircraft | null {
+  const icao24 = sanitizeText(row.hex, 8).toLowerCase();
+  if (!icao24) return null;
+
+  const lat = communityNum(row.lat);
+  const lon = communityNum(row.lon);
+  if (lat === null || lon === null) return null;
+  if (lat < -90 || lat > 90 || lon < -180 || lon > 180) return null;
+
+  const onGround = row.alt_baro === 'ground';
+  const altFt = communityNum(row.alt_baro);
+  const gsKt = communityNum(row.gs);
+  const climbFpm = communityNum(row.baro_rate);
+  const seen = communityNum(row.seen);
+  const lastContact = seen === null ? nowSeconds : nowSeconds - seen;
+  const callsign = row.flight ? sanitizeText(row.flight, 12) : null;
+
+  return {
+    icao24,
+    callsign: callsign && callsign.length > 0 ? callsign : null,
+    // The community feed carries no origin country. It is reported as unknown
+    // rather than guessed from a callsign prefix.
+    originCountry: 'Unknown',
+    lat,
+    lon,
+    altitudeM: altFt === null ? null : Math.round(altFt * FT_TO_M),
+    onGround,
+    velocityMs: gsKt === null ? null : Math.round(gsKt * KT_TO_MS * 10) / 10,
+    headingDeg: communityNum(row.track),
+    verticalRateMs: climbFpm === null ? null : Math.round(climbFpm * FPM_TO_MS * 100) / 100,
+    squawk: row.squawk ? sanitizeText(row.squawk, 8) : null,
+    ageSeconds: seen === null ? null : Math.max(0, Math.round(seen)),
+    lastContact: lastContact * 1000,
+  };
+}
+
+/**
+ * Reads the same regions from the community aggregator.
+ *
+ * Returns the identical `FlightsResult` shape so no consumer changes; a partial
+ * answer is still an answer, and only a total miss propagates.
+ */
+export async function fetchCommunityFlights(signal?: AbortSignal): Promise<FlightsResult> {
+  const results = await Promise.allSettled(
+    COMMUNITY_POINTS.map(async (point) => {
+      const response = await fetchJson<CommunityResponse>(
+        `${COMMUNITY_ADSB_BASE_URL}/v2/point/${point.lat}/${point.lon}/${COMMUNITY_RADIUS_NM}`,
+        {
+          provider: 'Community ADS-B',
+          timeoutMs: 12_000,
+          retries: 1,
+          headers: { 'User-Agent': OUTBOUND_USER_AGENT },
+          signal,
+        },
+      );
+      return { region: point.label, response };
+    }),
+  );
+
+  const fulfilled = results.filter(
+    (r): r is PromiseFulfilledResult<{ region: string; response: CommunityResponse }> =>
+      r.status === 'fulfilled',
+  );
+
+  const byIcao = new Map<string, Aircraft>();
+  let observedAt = 0;
+  const regionsQueried: string[] = [];
+
+  for (const entry of fulfilled) {
+    regionsQueried.push(entry.value.region);
+    const now = communityNum(entry.value.response.now) ?? Date.now();
+    observedAt = Math.max(observedAt, now);
+    const nowSeconds = Math.floor(now / 1000);
+    for (const row of entry.value.response.ac ?? []) {
+      const aircraft = mapCommunityRow(row, nowSeconds);
+      if (!aircraft) continue;
+      const existing = byIcao.get(aircraft.icao24);
+      if (!existing || (aircraft.ageSeconds ?? 999) < (existing.ageSeconds ?? 999)) {
+        byIcao.set(aircraft.icao24, aircraft);
+      }
+    }
+  }
+
+  const aircraft = [...byIcao.values()].sort((a, b) => (a.ageSeconds ?? 0) - (b.ageSeconds ?? 0));
+  const failed = results.length - fulfilled.length;
+
+  return {
+    observedAt: observedAt || Date.now(),
+    aircraft,
+    coverage: 'regional',
+    regionLabel: regionsQueried.join(' · '),
+    notice:
+      failed > 0
+        ? `OpenSky Network was unreachable; showing community ADS-B data (${failed} of ${results.length} sampled regions did not respond).`
+        : 'OpenSky Network was unreachable; showing community ADS-B data (coarser coverage, origin country unavailable).',
+    regionsQueried,
+  };
+}
+
 /**
  * Samples the configured regions concurrently.
  *
@@ -207,6 +366,12 @@ export async function fetchFlights(signal?: AbortSignal): Promise<FlightsResult>
   );
 
   if (fulfilled.length === 0) {
+    // OpenSky is unreachable from some hosts (measured: the TCP handshake times
+    // out on both address families from this deployment's egress), so a
+    // key-free community aggregator takes over rather than the layer going blank.
+    const fallback = await fetchCommunityFlights(signal).catch(() => null);
+    if (fallback && fallback.aircraft.length > 0) return fallback;
+
     const first = results[0];
     if (first && first.status === 'rejected' && first.reason instanceof UpstreamError) throw first.reason;
     throw new UpstreamError('OpenSky Network did not return any state vectors.', {

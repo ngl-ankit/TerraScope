@@ -1,6 +1,6 @@
 import { getWeather } from '@/lib/api';
-import { cached, TTL } from '@/lib/api/cache';
-import { toRouteError } from '@/lib/api/http';
+import { cached, TTL, cooldownRemaining, setCooldown } from '@/lib/api/cache';
+import { toRouteError, UpstreamError } from '@/lib/api/http';
 import type { ApiEnvelope, WeatherBundle } from '@/lib/types';
 
 /**
@@ -29,17 +29,29 @@ export async function GET(request: Request) {
     );
   }
 
-  try {
-    // Cache per ~1 km grid cell. A forecast only changes hourly, but without
-    // this every selection, every poll and every retry became its own upstream
-    // call, which is what pushed Open-Meteo into answering 429 to Render's
-    // shared egress IP. The cache also serves the last good forecast (stale)
-    // when the provider refuses, so a 429 can no longer blank the panel.
-    const cell = `${Math.round(lat * 100) / 100}:${Math.round(lon * 100) / 100}`;
-    const outcome = await cached(
-      { key: `weather:${cell}`, ttlMs: TTL.weather() },
-      () => getWeather(lat, lon, request.signal),
+  // Cache per ~1 km grid cell. A forecast only changes hourly, but without this
+  // every selection, every poll and every retry became its own upstream call,
+  // which is what pushed Open-Meteo into answering 429 to Render's shared egress
+  // IP. The cache also serves the last good forecast (stale) when the provider
+  // refuses, so a 429 can no longer blank the panel.
+  const cell = `${Math.round(lat * 100) / 100}:${Math.round(lon * 100) / 100}`;
+  const key = `weather:${cell}`;
+
+  // While the provider is refusing us, answer from the cooldown rather than
+  // becoming another upstream call.
+  const cooling = cooldownRemaining(key);
+  if (cooling > 0) {
+    return Response.json(
+      { error: 'Open-Meteo is rate limiting requests.', code: 'upstream_rate_limited', retryable: true },
+      {
+        status: 429,
+        headers: { 'Cache-Control': 'no-store', 'Retry-After': String(Math.ceil(cooling / 1000)) },
+      },
     );
+  }
+
+  try {
+    const outcome = await cached({ key, ttlMs: TTL.weather() }, () => getWeather(lat, lon, request.signal));
     const body: ApiEnvelope<WeatherBundle> = {
       data: outcome.value.data,
       meta: { ...outcome.value.meta, stale: outcome.stale },
@@ -47,6 +59,17 @@ export async function GET(request: Request) {
     return Response.json(body, { headers: { 'Cache-Control': 'no-store' } });
   } catch (error) {
     const { body, status } = toRouteError(error, 'Open-Meteo');
-    return Response.json(body, { status, headers: { 'Cache-Control': 'no-store' } });
+
+    // Both Open-Meteo and the MET Norway fallback refused: hold off before
+    // asking again, and tell the client how long to wait.
+    if (error instanceof UpstreamError && error.retryable) setCooldown(key, 60_000);
+
+    return Response.json(body, {
+      status,
+      headers: {
+        'Cache-Control': 'no-store',
+        ...(error instanceof UpstreamError && error.retryable ? { 'Retry-After': '60' } : {}),
+      },
+    });
   }
 }

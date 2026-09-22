@@ -22,6 +22,7 @@ const HOSTS = [
   'air-quality-api.open-meteo.com',
   'earthquake.usgs.gov',
   'api.met.no',
+  'api.adsb.lol',
 ];
 
 async function tcp(host: string, ms = 6000, family?: 4 | 6) {

@@ -119,3 +119,33 @@ export const TTL = {
   geocode: () => envSeconds('CACHE_TTL_GEOCODE', 300) * 1000,
   weather: () => envSeconds('CACHE_TTL_WEATHER', 3600) * 1000,
 };
+
+/**
+ * Short-lived negative cache ("cooldown").
+ *
+ * A TTL cache only remembers successes, so a provider answering 429 was asked
+ * again on the very next request — one refusal became a wall of them, each one
+ * spending more of the same quota. Recording the refusal for a bounded window
+ * turns that into a single upstream call followed by fast, honest answers.
+ *
+ * Bounded on purpose: the key expires on its own, so a recovered provider is
+ * picked up again without a restart.
+ */
+const cooldowns = new Map<string, number>();
+
+/** Hold off on `key` for `ms` milliseconds. */
+export function setCooldown(key: string, ms: number) {
+  if (ms > 0) cooldowns.set(key, Date.now() + ms);
+}
+
+/** Milliseconds left on a cooldown, or 0 when the key is free to call. */
+export function cooldownRemaining(key: string): number {
+  const until = cooldowns.get(key);
+  if (until === undefined) return 0;
+  const left = until - Date.now();
+  if (left <= 0) {
+    cooldowns.delete(key);
+    return 0;
+  }
+  return left;
+}
