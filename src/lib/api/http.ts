@@ -1,4 +1,26 @@
 /**
+ * Prefer IPv4 for every outbound provider call.
+ *
+ * Measured from this deployment's own egress: NASA EONET resolves to both
+ * 129.164.142.189 (v4) and 2001:4d0:2310:170::189 (v6); a raw TCP :443
+ * handshake succeeds on IPv4 in ~404ms and fails instantly on IPv6 with
+ * ENETUNREACH. Node's default resolver ordering still tries IPv6 first and the
+ * connect then hangs until the request timeout, which is what produced the
+ * /api/natural-events 502 while USGS and Open-Meteo (IPv4-first in practice)
+ * kept returning 200.
+ *
+ * Setting the order here rather than via NODE_OPTIONS matters because
+ * NODE_OPTIONS from render.yaml is not applied to an already-created service,
+ * so an env-only fix would silently do nothing.
+ */
+import dns from 'node:dns';
+
+try {
+  dns.setDefaultResultOrder('ipv4first');
+} catch {
+  // Older runtimes: the fetch defaults remain, and the retry loop still covers it.
+}
+/**
  * Server-side HTTP plumbing shared by every API client.
  *
  * Responsibilities:
