@@ -1,0 +1,30 @@
+# TerraScope — Render blueprint (free instance, 512 MB)
+# Deploy: Render Dashboard → New → Blueprint → point at the repo, Render reads this file.
+services:
+  - type: web
+    name: terrascope
+    runtime: node
+    plan: free
+    region: singapore          # closest free region to an Indian deployer; change if you like
+    branch: main
+    buildCommand: npm ci --include=dev && npm run render_build
+    startCommand: npm run start
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      # Every variable is OPTIONAL — TerraScope runs key-free. These are sensible defaults.
+      - key: NODE_VERSION
+        value: "22"
+      - key: NEXT_TELEMETRY_DISABLED
+        value: "1"
+      - key: NEXT_PUBLIC_SITE_URL
+        value: https://terrascope.onrender.com
+      # OpenSky anonymous access is throttled (~400 credits/day on /states/all).
+      # Register an OAuth2 client at https://opensky-network.org/my-opensky/account
+      # and paste the pair here (mark them Sensitive) to lift the limit.
+      - key: OPEN_SKY_CLIENT_ID
+        sync: false
+      - key: OPEN_SKY_CLIENT_SECRET
+        sync: false
+      - key: NOMINATIM_USER_AGENT
+        value: TerraScope/1.0 (https://github.com/ngl-ankit)

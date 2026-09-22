@@ -1,0 +1,6 @@
+User-agent: *
+Allow: /
+Disallow: /api/
+
+# TerraScope reads public data APIs; nothing on this site is private.
+Sitemap: /sitemap.xml
