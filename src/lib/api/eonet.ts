@@ -173,12 +173,36 @@ export function normaliseNaturalEvents(response: EonetResponse): NaturalEventsPa
   return { events, observedAt: newest > 0 ? newest : null };
 }
 
+const ATTEMPTS = 3;
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export async function fetchNaturalEvents(signal?: AbortSignal): Promise<NaturalEventsPayload> {
   const url = `${baseUrl()}/events?status=open&days=14&limit=140`;
-  const response = await fetchJson<EonetResponse>(url, {
-    provider: 'NASA EONET',
-    timeoutMs: 18_000,
-    signal,
-  });
-  return normaliseNaturalEvents(response);
+  let lastError: unknown;
+
+  // EONET's /events collection is rebuilt per request: it is measurably slower
+  // than /events/geojson and it occasionally drops the TLS connection outright.
+  // A dropped connection surfaces as an instant failure (observed ~0.6s, not a
+  // timeout), and a second attempt almost always clears it — so retry with
+  // backoff before degrading the layer.
+  for (let attempt = 1; attempt <= ATTEMPTS; attempt += 1) {
+    if (signal?.aborted) break;
+    try {
+      const response = await fetchJson<EonetResponse>(url, {
+        provider: 'NASA EONET',
+        timeoutMs: attempt === 1 ? 20_000 : 25_000,
+        signal,
+      });
+      return normaliseNaturalEvents(response);
+    } catch (error) {
+      lastError = error;
+      if (signal?.aborted) break;
+      if (attempt < ATTEMPTS) await delay(700 * attempt);
+    }
+  }
+
+  throw lastError;
 }

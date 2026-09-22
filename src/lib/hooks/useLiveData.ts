@@ -158,9 +158,14 @@ function useWeatherLoop(lat: number | null, lon: number | null, enabled: boolean
   const setWeather = useTerraScope((s) => s.setWeather);
   const setLayerError = useTerraScope((s) => s.setLayerError);
   const setRetrying = useTerraScope((s) => s.setRetrying);
+  // Open-Meteo limits per IP and the server now caches per coordinate, so a 429
+  // arriving here means the edge refused us. Back the loop off for two minutes
+  // instead of retrying on the normal cadence and deepening the hole.
+  const [rateLimitedUntil, setRateLimitedUntil] = useState(0);
 
   const run = useMemo(
     () => async (signal: AbortSignal) => {
+      if (Date.now() < rateLimitedUntil) return;
       if (lat === null || lon === null) return;
       try {
         const envelope = await apiGet<WeatherBundle>(
@@ -171,9 +176,17 @@ function useWeatherLoop(lat: number | null, lon: number | null, enabled: boolean
       } catch (error) {
         if (signal.aborted) return;
         setLayerError('weather', describeApiError(error, 'Open-Meteo'));
+        if (
+          typeof error === 'object' &&
+          error !== null &&
+          'status' in error &&
+          (error as { status: number }).status === 429
+        ) {
+          setRateLimitedUntil(Date.now() + 120_000);
+        }
       }
     },
-    [lat, lon, setLayerError, setWeather],
+    [lat, lon, rateLimitedUntil, setLayerError, setWeather],
   );
 
   const active = enabled && lat !== null && lon !== null;
@@ -181,6 +194,7 @@ function useWeatherLoop(lat: number | null, lon: number | null, enabled: boolean
 
   return () => {
     setRetrying('weather', true);
+    setRateLimitedUntil(0);
     refresh();
   };
 }
