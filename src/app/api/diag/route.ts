@@ -1,73 +1,74 @@
+import dns from 'node:dns/promises';
+import net from 'node:net';
+
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
 
 /**
  * GET /api/diag — outbound reachability probe.
  *
- * Reports, per upstream host, the real error behind a failed provider request
- * and whether a User-Agent changes the outcome. Only reachability is returned;
- * no key, credential or response payload is exposed.
+ * Several providers time out from this deployment's network while working from
+ * elsewhere, so this reports the *mechanism*, not just the outcome: which
+ * address families each host resolves to, whether a raw TCP handshake on :443
+ * succeeds, and whether the HTTP call succeeds when pinned to IPv4 or IPv6.
+ * Returns reachability only — no key, credential or response payload.
  */
 
-const UAS: Record<string, string | null> = {
-  none: null,
-  plain: 'TerraScope/1.0 (+https://github.com/ngl-ankit/TerraScope)',
-  browser:
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-};
+const HOSTS = [
+  'eonet.gsfc.nasa.gov',
+  'opensky-network.org',
+  'auth.opensky-network.org',
+  'api.open-meteo.com',
+  'air-quality-api.open-meteo.com',
+  'earthquake.usgs.gov',
+];
 
-const TARGETS: Record<string, string> = {
-  eonet_events: 'https://eonet.gsfc.nasa.gov/api/v3/events?status=open&days=14&limit=140',
-  eonet_geojson: 'https://eonet.gsfc.nasa.gov/api/v3/events/geojson?status=open&days=14',
-  opensky_auth:
-    'https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token',
-  openmeteo_forecast:
-    'https://api.open-meteo.com/v1/forecast?latitude=30.1656&longitude=76.8465&current=temperature_2m',
-  openmeteo_air:
-    'https://air-quality-api.open-meteo.com/v1/air-quality?latitude=30.1656&longitude=76.8465&current=european_aqi',
-  usgs: 'https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/2.5_day.geojson',
-};
-
-async function probe(url: string, ua: string | null) {
+async function tcp(host: string, ms = 6000, family?: 4 | 6) {
   const started = Date.now();
+  return new Promise<{ ok: boolean; ms: number; err: string | null }>((resolve) => {
+    const socket = family ? net.connect({ host, port: 443, family }) : net.connect({ host, port: 443 });
+    let settled = false;
+    const finish = (ok: boolean, err: string | null) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve({ ok, ms: Date.now() - started, err });
+    };
+    socket.setTimeout(ms);
+    socket.once('connect', () => finish(true, null));
+    socket.once('timeout', () => finish(false, 'timeout'));
+    socket.once('error', (e: NodeJS.ErrnoException) => finish(false, e.code ?? e.message));
+  });
+}
+
+async function lookup(host: string) {
   try {
-    const response = await fetch(url, {
-      headers: ua ? { 'User-Agent': ua } : undefined,
-      signal: AbortSignal.timeout(8_000),
-      cache: 'no-store',
-    });
-    return { ok: response.ok, status: response.status, ms: Date.now() - started };
-  } catch (error) {
-    const e = error as {
-      name?: string;
-      message?: string;
-      cause?: { code?: string; message?: string };
-    };
-    return {
-      ok: false,
-      status: null,
-      ms: Date.now() - started,
-      error: `${e?.name ?? 'Error'}: ${e?.message ?? String(error)}`,
-      cause: e?.cause?.code ?? e?.cause?.message ?? null,
-    };
+    const addrs = await dns.lookup(host, { all: true });
+    return addrs.map((a) => `v${a.family}:${a.address}`);
+  } catch (e) {
+    return [`dns-error:${(e as Error).message}`];
   }
 }
 
 export async function GET() {
-  const entries = await Promise.all(
-    Object.entries(TARGETS).map(async ([key, url]) => {
-      const probes = await Promise.all(
-        Object.entries(UAS).map(async ([label, ua]) => [label, await probe(url, ua)] as const),
-      );
-      return [key, Object.fromEntries(probes)] as const;
+  const results = await Promise.all(
+    HOSTS.map(async (host) => {
+      const addresses = await lookup(host);
+      const [hostname, v4, v6] = await Promise.all([
+        tcp(host),
+        tcp(host, 6000, 4),
+        tcp(host, 6000, 6),
+      ]);
+      return [host, { addresses, tcpHostname: hostname, tcpIPv4: v4, tcpIPv6: v6 }] as const;
     }),
   );
 
   return Response.json(
     {
       commit: process.env.RENDER_GIT_COMMIT ?? null,
+      nodeOptions: process.env.NODE_OPTIONS ?? null,
       time: new Date().toISOString(),
-      targets: Object.fromEntries(entries),
+      network: Object.fromEntries(results),
     },
     { headers: { 'Cache-Control': 'no-store' } },
   );
